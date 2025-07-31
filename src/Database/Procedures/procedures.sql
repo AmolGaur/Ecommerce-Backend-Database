@@ -2,8 +2,13 @@
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 -- Stored procedure to process an order, verifying stock and updating inventory
-CREATE OR REPLACE FUNCTION process_order(customer_id INTEGER, order_items JSONB)
-RETURNS VOID AS $$
+CREATE OR REPLACE FUNCTION process_order(
+    p_customer_id INTEGER,
+    p_order_items JSONB,
+    p_shipping_address_id INTEGER,
+    p_billing_address_id INTEGER DEFAULT NULL,
+    p_shipping_method VARCHAR(50) DEFAULT 'standard'
+) RETURNS INTEGER AS $$
 DECLARE
     item RECORD;
     total_price DECIMAL(10, 2) := 0;
@@ -209,5 +214,344 @@ BEGIN
     GROUP BY product_1, product_2
     HAVING COUNT(*) > 1
     ORDER BY bundle_count DESC;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Procedure to manage product variants
+CREATE OR REPLACE FUNCTION manage_product_variant(
+    p_product_id INTEGER,
+    p_variant_name VARCHAR(255),
+    p_attributes JSONB,
+    p_price_adjustment DECIMAL(10, 2),
+    p_stock INTEGER,
+    p_action VARCHAR(10)
+) RETURNS INTEGER AS $$
+DECLARE
+    v_variant_id INTEGER;
+BEGIN
+    CASE p_action
+        WHEN 'create' THEN
+            INSERT INTO Product_Variant (
+                product_id,
+                variant_name,
+                attributes,
+                price_adjustment,
+                stock
+            ) VALUES (
+                p_product_id,
+                p_variant_name,
+                p_attributes,
+                p_price_adjustment,
+                p_stock
+            ) RETURNING variant_id INTO v_variant_id;
+            
+            RETURN v_variant_id;
+            
+        WHEN 'update' THEN
+            UPDATE Product_Variant
+            SET
+                variant_name = p_variant_name,
+                attributes = p_attributes,
+                price_adjustment = p_price_adjustment,
+                stock = p_stock,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE product_id = p_product_id AND variant_name = p_variant_name
+            RETURNING variant_id INTO v_variant_id;
+            
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'Variant not found';
+            END IF;
+            
+            RETURN v_variant_id;
+            
+        ELSE
+            RAISE EXCEPTION 'Invalid action';
+    END CASE;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Procedure to manage product bundles
+CREATE OR REPLACE FUNCTION manage_product_bundle(
+    p_name VARCHAR(255),
+    p_description TEXT,
+    p_discount_percentage DECIMAL(5, 2),
+    p_products JSONB,
+    p_action VARCHAR(10)
+) RETURNS INTEGER AS $$
+DECLARE
+    v_bundle_id INTEGER;
+    v_product RECORD;
+BEGIN
+    CASE p_action
+        WHEN 'create' THEN
+            -- Create bundle
+            INSERT INTO Product_Bundle (
+                name,
+                description,
+                discount_percentage,
+                is_active,
+                valid_from,
+                valid_until
+            ) VALUES (
+                p_name,
+                p_description,
+                p_discount_percentage,
+                true,
+                CURRENT_TIMESTAMP,
+                CURRENT_TIMESTAMP + INTERVAL '1 year'
+            ) RETURNING bundle_id INTO v_bundle_id;
+            
+            -- Add products to bundle
+            FOR v_product IN SELECT * FROM jsonb_array_elements(p_products) LOOP
+                INSERT INTO Bundle_Item (
+                    bundle_id,
+                    product_id,
+                    quantity
+                ) VALUES (
+                    v_bundle_id,
+                    (v_product->>'product_id')::INTEGER,
+                    COALESCE((v_product->>'quantity')::INTEGER, 1)
+                );
+            END LOOP;
+            
+            RETURN v_bundle_id;
+            
+        WHEN 'update' THEN
+            -- Update bundle
+            UPDATE Product_Bundle
+            SET
+                name = p_name,
+                description = p_description,
+                discount_percentage = p_discount_percentage,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE name = p_name
+            RETURNING bundle_id INTO v_bundle_id;
+            
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'Bundle not found';
+            END IF;
+            
+            -- Remove existing items
+            DELETE FROM Bundle_Item WHERE bundle_id = v_bundle_id;
+            
+            -- Add updated products
+            FOR v_product IN SELECT * FROM jsonb_array_elements(p_products) LOOP
+                INSERT INTO Bundle_Item (
+                    bundle_id,
+                    product_id,
+                    quantity
+                ) VALUES (
+                    v_bundle_id,
+                    (v_product->>'product_id')::INTEGER,
+                    COALESCE((v_product->>'quantity')::INTEGER, 1)
+                );
+            END LOOP;
+            
+            RETURN v_bundle_id;
+            
+        ELSE
+            RAISE EXCEPTION 'Invalid action';
+    END CASE;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Procedure to validate and apply coupon
+CREATE OR REPLACE FUNCTION apply_coupon(
+    p_order_id INTEGER,
+    p_coupon_code VARCHAR(50)
+) RETURNS DECIMAL(10, 2) AS $$
+DECLARE
+    v_coupon RECORD;
+    v_order_total DECIMAL(10, 2);
+    v_discount_amount DECIMAL(10, 2) := 0;
+BEGIN
+    -- Get coupon details
+    SELECT * INTO v_coupon
+    FROM Coupon
+    WHERE code = p_coupon_code
+    AND is_active = true
+    AND valid_from <= CURRENT_TIMESTAMP
+    AND valid_until >= CURRENT_TIMESTAMP
+    AND (usage_limit IS NULL OR used_count < usage_limit);
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Invalid or expired coupon code';
+    END IF;
+
+    -- Get order total
+    SELECT total_price INTO v_order_total
+    FROM "Order"
+    WHERE order_id = p_order_id;
+
+    -- Validate minimum purchase amount
+    IF v_coupon.min_purchase_amount IS NOT NULL AND v_order_total < v_coupon.min_purchase_amount THEN
+        RAISE EXCEPTION 'Order total does not meet minimum purchase requirement';
+    END IF;
+
+    -- Calculate discount
+    CASE v_coupon.type
+        WHEN 'percentage' THEN
+            v_discount_amount := v_order_total * (v_coupon.value / 100);
+        WHEN 'fixed' THEN
+            v_discount_amount := v_coupon.value;
+        WHEN 'buy_x_get_y' THEN
+            -- Implementation for buy X get Y logic
+            v_discount_amount := calculate_buy_x_get_y_discount(p_order_id, v_coupon.applies_to);
+        WHEN 'free_shipping' THEN
+            SELECT shipping_cost INTO v_discount_amount
+            FROM "Order"
+            WHERE order_id = p_order_id;
+    END CASE;
+
+    -- Apply maximum discount limit if exists
+    IF v_coupon.max_discount_amount IS NOT NULL THEN
+        v_discount_amount := LEAST(v_discount_amount, v_coupon.max_discount_amount);
+    END IF;
+
+    -- Update order with discount
+    UPDATE "Order"
+    SET
+        discount_amount = v_discount_amount,
+        coupon_code = p_coupon_code,
+        total_price = v_order_total - v_discount_amount
+    WHERE order_id = p_order_id;
+
+    -- Update coupon usage count
+    UPDATE Coupon
+    SET used_count = used_count + 1
+    WHERE code = p_coupon_code;
+
+    RETURN v_discount_amount;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Helper function to calculate buy X get Y discount
+CREATE OR REPLACE FUNCTION calculate_buy_x_get_y_discount(
+    p_order_id INTEGER,
+    p_applies_to JSONB
+) RETURNS DECIMAL(10, 2) AS $$
+DECLARE
+    v_discount DECIMAL(10, 2) := 0;
+    v_item RECORD;
+BEGIN
+    -- Implementation depends on the structure of applies_to JSONB
+    -- Example: {"buy": 2, "get": 1, "discount_percent": 100, "category_id": 1}
+    -- This is a placeholder for the actual implementation
+    RETURN v_discount;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Procedure to manage loyalty points
+CREATE OR REPLACE FUNCTION manage_loyalty_points(
+    p_customer_id INTEGER,
+    p_action VARCHAR(10),
+    p_points INTEGER,
+    p_order_id INTEGER DEFAULT NULL
+) RETURNS INTEGER AS $$
+DECLARE
+    v_current_points INTEGER;
+    v_new_points INTEGER;
+    v_tier_status VARCHAR(20);
+BEGIN
+    -- Get current points
+    SELECT loyalty_points INTO v_current_points
+    FROM Customer
+    WHERE customer_id = p_customer_id;
+
+    -- Calculate new points based on action
+    CASE p_action
+        WHEN 'earn' THEN
+            v_new_points := v_current_points + p_points;
+        WHEN 'redeem' THEN
+            IF v_current_points < p_points THEN
+                RAISE EXCEPTION 'Insufficient loyalty points';
+            END IF;
+            v_new_points := v_current_points - p_points;
+        ELSE
+            RAISE EXCEPTION 'Invalid action';
+    END CASE;
+
+    -- Determine new tier status
+    v_tier_status := CASE
+        WHEN v_new_points >= 5000 THEN 'platinum'
+        WHEN v_new_points >= 2000 THEN 'gold'
+        WHEN v_new_points >= 1000 THEN 'silver'
+        ELSE 'bronze'
+    END;
+
+    -- Update customer points and tier
+    UPDATE Customer
+    SET
+        loyalty_points = v_new_points,
+        tier_status = v_tier_status
+    WHERE customer_id = p_customer_id;
+
+    -- Log points transaction if order_id provided
+    IF p_order_id IS NOT NULL THEN
+        INSERT INTO Loyalty_Transaction (
+            customer_id,
+            order_id,
+            points,
+            action,
+            transaction_date
+        ) VALUES (
+            p_customer_id,
+            p_order_id,
+            p_points,
+            p_action,
+            CURRENT_TIMESTAMP
+        );
+    END IF;
+
+    RETURN v_new_points;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Procedure to process product returns and refunds
+CREATE OR REPLACE FUNCTION process_return(
+    p_order_id INTEGER,
+    p_customer_id INTEGER,
+    p_items JSONB,
+    p_reason TEXT
+) RETURNS INTEGER AS $$
+DECLARE
+    v_return_id INTEGER;
+    v_refund_amount DECIMAL(10, 2) := 0;
+    v_item RECORD;
+BEGIN
+    -- Create return record
+    INSERT INTO Return (order_id, customer_id, reason, status)
+    VALUES (p_order_id, p_customer_id, p_reason, 'requested')
+    RETURNING return_id INTO v_return_id;
+
+    -- Process each return item
+    FOR v_item IN SELECT * FROM jsonb_array_elements(p_items) LOOP
+        -- Calculate refund amount
+        SELECT (oi.unit_price * (v_item->>'quantity')::INTEGER)
+        INTO v_refund_amount
+        FROM Order_Item oi
+        WHERE oi.order_id = p_order_id
+        AND oi.product_id = (v_item->>'product_id')::INTEGER;
+
+        -- Insert return items
+        INSERT INTO Return_Item (
+            return_id,
+            product_id,
+            quantity,
+            reason
+        ) VALUES (
+            v_return_id,
+            (v_item->>'product_id')::INTEGER,
+            (v_item->>'quantity')::INTEGER,
+            (v_item->>'reason')::TEXT
+        );
+    END LOOP;
+
+    -- Update return record with refund amount
+    UPDATE Return
+    SET refund_amount = v_refund_amount
+    WHERE return_id = v_return_id;
+
+    RETURN v_return_id;
 END;
 $$ LANGUAGE plpgsql;
