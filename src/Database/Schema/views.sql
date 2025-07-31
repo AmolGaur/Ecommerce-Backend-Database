@@ -1,102 +1,97 @@
--- Materialized view for daily revenue summaries
-CREATE MATERIALIZED VIEW daily_sales_summary AS
-SELECT 
-    DATE_TRUNC('day', order_date) AS day,
-    SUM(total_price) AS daily_revenue
-FROM "Order"
-GROUP BY day
-ORDER BY day;
+-- Advanced Analytics Views for E-commerce Database
 
--- Materialized view for monthly revenue summaries
-CREATE MATERIALIZED VIEW monthly_revenue_summary AS
+-- Customer Analytics Views
+CREATE MATERIALIZED VIEW customer_analytics AS
 SELECT 
-    DATE_TRUNC('month', order_date) AS month,
-    SUM(total_price) AS monthly_revenue
-FROM "Order"
-GROUP BY month
-ORDER BY month;
+    c.customer_id,
+    c.email,
+    c.type AS customer_type,
+    COUNT(DISTINCT o.order_id) AS total_orders,
+    COALESCE(SUM(o.total_price), 0) AS total_spent,
+    COALESCE(AVG(o.total_price), 0) AS avg_order_value,
+    MAX(o.order_date) AS last_order_date,
+    COUNT(DISTINCT oi.product_id) AS unique_products_bought,
+    CASE 
+        WHEN COALESCE(SUM(o.total_price), 0) > 1000 THEN 'VIP'
+        WHEN COALESCE(SUM(o.total_price), 0) > 500 THEN 'Regular'
+        ELSE 'New'
+    END AS customer_segment,
+    COALESCE(AVG(r.rating), 0) AS avg_rating_given
+FROM 
+    Customer c
+    LEFT JOIN "Order" o ON c.customer_id = o.customer_id
+    LEFT JOIN Order_Item oi ON o.order_id = oi.order_id
+    LEFT JOIN Review r ON c.customer_id = r.customer_id
+GROUP BY 
+    c.customer_id, c.email, c.type
+WITH DATA;
 
--- Materialized view for popular product categories
-CREATE MATERIALIZED VIEW popular_categories AS
+-- Sales Performance Analytics
+CREATE MATERIALIZED VIEW sales_analytics AS
 SELECT 
-    Product.category_id,
-    Category.name AS category_name,
-    COUNT(Order_Item.product_id) AS product_sales_count
-FROM Order_Item
-JOIN Product ON Order_Item.product_id = Product.product_id
-JOIN Category ON Product.category_id = Category.category_id
-GROUP BY Product.category_id, Category.name
-ORDER BY product_sales_count DESC;
+    DATE_TRUNC('day', o.order_date) AS sale_date,
+    COUNT(DISTINCT o.order_id) AS total_orders,
+    COUNT(DISTINCT o.customer_id) AS unique_customers,
+    SUM(o.total_price) AS total_revenue,
+    AVG(o.total_price) AS avg_order_value,
+    SUM(oi.quantity) AS total_units_sold,
+    SUM(oi.quantity * (p.price - COALESCE(p.cost_price, p.price * 0.7))) AS estimated_profit,
+    COUNT(DISTINCT p.category_id) AS categories_sold
+FROM 
+    "Order" o
+    JOIN Order_Item oi ON o.order_id = oi.order_id
+    JOIN Product p ON oi.product_id = p.product_id
+GROUP BY 
+    DATE_TRUNC('day', o.order_date)
+WITH DATA;
 
--- Materialized view for top-selling products summary
-CREATE MATERIALIZED VIEW top_selling_products_summary AS
+-- Product Performance Analytics
+CREATE MATERIALIZED VIEW product_analytics AS
 SELECT 
-    Order_Item.product_id,
-    Product.title,
-    SUM(Order_Item.quantity) AS total_quantity_sold
-FROM Order_Item
-JOIN Product ON Order_Item.product_id = Product.product_id
-GROUP BY Order_Item.product_id, Product.title
-ORDER BY total_quantity_sold DESC;
+    p.product_id,
+    p.title,
+    p.category_id,
+    c.name AS category_name,
+    COUNT(DISTINCT oi.order_id) AS order_count,
+    SUM(oi.quantity) AS total_quantity_sold,
+    SUM(oi.quantity * oi.price) AS total_revenue,
+    AVG(r.rating) AS avg_rating,
+    COUNT(r.review_id) AS review_count,
+    p.stock AS current_stock,
+    CASE 
+        WHEN p.stock < p.low_stock_threshold THEN 'Low'
+        WHEN p.stock < (p.low_stock_threshold * 2) THEN 'Medium'
+        ELSE 'Good'
+    END AS stock_status,
+    COALESCE(
+        SUM(oi.quantity) / NULLIF(EXTRACT(DAYS FROM (NOW() - MIN(o.order_date))), 0),
+        0
+    ) AS daily_sales_rate
+FROM 
+    Product p
+    LEFT JOIN Category c ON p.category_id = c.category_id
+    LEFT JOIN Order_Item oi ON p.product_id = oi.product_id
+    LEFT JOIN "Order" o ON oi.order_id = o.order_id
+    LEFT JOIN Review r ON p.product_id = r.product_id
+GROUP BY 
+    p.product_id, p.title, p.category_id, c.name, p.stock, p.low_stock_threshold
+WITH DATA;
 
--- Materialized view for product popularity trends over time
-CREATE MATERIALIZED VIEW product_popularity_trends AS
+-- Inventory Analytics
+CREATE MATERIALIZED VIEW inventory_analytics AS
 SELECT 
-    Product.product_id,
-    Product.title,
-    DATE_TRUNC('month', "Order".order_date) AS month,
-    SUM(Order_Item.quantity) AS quantity_sold
-FROM Order_Item
-JOIN Product ON Order_Item.product_id = Product.product_id
-JOIN "Order" ON Order_Item.order_id = "Order".order_id
-GROUP BY Product.product_id, Product.title, month
-ORDER BY month, quantity_sold DESC;
-
--- View for filtering products by category
-CREATE VIEW products_by_category AS
-SELECT 
-    product_id, 
-    title, 
-    description, 
-    price, 
-    average_rating, 
-    category_id 
-FROM Product
-WHERE category_id IS NOT NULL;
-
--- View for filtering products by price range
-CREATE VIEW products_by_price_range AS
-SELECT 
-    product_id, 
-    title, 
-    description, 
-    price, 
-    average_rating, 
-    category_id 
-FROM Product
-WHERE price BETWEEN 10 AND 100;  -- Replace with dynamic range as needed
-
--- View for filtering products by rating
-CREATE VIEW products_by_rating AS
-SELECT 
-    product_id, 
-    title, 
-    description, 
-    price, 
-    average_rating, 
-    category_id 
-FROM Product
-WHERE average_rating >= 4;  -- Replace with desired minimum rating
-
--- Materialized view for frequently accessed top-rated products
-CREATE MATERIALIZED VIEW top_rated_products AS
-SELECT 
-    product_id, 
-    title, 
-    description, 
-    price, 
-    average_rating, 
-    category_id 
-FROM Product
-WHERE average_rating >= 4
-ORDER BY average_rating DESC;
+    p.product_id,
+    p.title,
+    p.stock AS current_stock,
+    p.low_stock_threshold,
+    COUNT(il.log_id) AS stock_updates,
+    COALESCE(SUM(il.change), 0) AS total_stock_change,
+    MAX(il.change_date) AS last_stock_update,
+    COALESCE(AVG(oi.quantity), 0) AS avg_order_quantity,
+    COALESCE(
+        SUM(CASE 
+            WHEN o.order_date >= NOW() - INTERVAL '30 days' 
+            THEN oi.quantity 
+        END), 0
+    ) AS last_30_days_sales,
+    CEIL

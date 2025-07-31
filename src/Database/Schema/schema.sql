@@ -1,7 +1,15 @@
--- Step 1: Create Tables Without Foreign Keys
+-- Enable required extensions
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 
--- Customer table, storing customer details with a reference to the default address
--- Modify Customer table to store hashed passwords in BYTEA format
+-- Create custom types for better data integrity
+CREATE TYPE order_status AS ENUM ('pending', 'processing', 'shipped', 'delivered', 'cancelled');
+CREATE TYPE payment_status AS ENUM ('pending', 'completed', 'failed', 'refunded');
+CREATE TYPE payment_method AS ENUM ('credit_card', 'debit_card', 'upi', 'net_banking', 'wallet');
+CREATE TYPE inventory_action AS ENUM ('increase', 'decrease', 'adjustment');
+
+-- Create partitioned tables for better performance
 CREATE TABLE Customer (
     customer_id SERIAL PRIMARY KEY,
     first_name VARCHAR(100) NOT NULL,
@@ -12,195 +20,95 @@ CREATE TABLE Customer (
     age INT DEFAULT 18 CHECK (age >= 18),
     photoUrl TEXT,
     type VARCHAR(255) DEFAULT 'local',
-    total_spent DECIMAL(12, 2) DEFAULT 0, -- Tracks cumulative spending by the customer
-    default_address INTEGER
-);
+    total_spent DECIMAL(12, 2) DEFAULT 0,
+    default_address INTEGER,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_login TIMESTAMP,
+    account_status VARCHAR(20) DEFAULT 'active',
+    marketing_preferences JSONB,
+    metadata JSONB,
+    CONSTRAINT email_format CHECK (email ~* '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$')
+) PARTITION BY RANGE (created_at);
 
--- Address table, storing customer addresses
+-- Create partitions for Customer table
+CREATE TABLE customer_y2024 PARTITION OF Customer
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE customer_y2025 PARTITION OF Customer
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+
+-- Create Address table with enhanced validation
 CREATE TABLE Address (
     address_id SERIAL PRIMARY KEY,
-    line1 VARCHAR(255),
+    customer_id INTEGER NOT NULL,
+    line1 VARCHAR(255) NOT NULL,
     line2 VARCHAR(255),
-    city VARCHAR(45),
-    state VARCHAR(45),
+    city VARCHAR(45) NOT NULL,
+    state VARCHAR(45) NOT NULL,
     street_name VARCHAR(45),
-    country VARCHAR(45),
-    phone VARCHAR(10),
-    pincode INT,
-    customer_id INTEGER NOT NULL
+    country VARCHAR(45) NOT NULL,
+    phone VARCHAR(20) NOT NULL,
+    pincode VARCHAR(10) NOT NULL,
+    is_default BOOLEAN DEFAULT false,
+    address_type VARCHAR(20) DEFAULT 'home',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT valid_phone CHECK (phone ~ '^[+]?[0-9]{10,15}$'),
+    CONSTRAINT valid_pincode CHECK (pincode ~ '^[0-9]{5,10}$')
 );
 
--- Shipment table, storing shipment details associated with customers
-CREATE TABLE Shipment (
-    shipment_id SERIAL PRIMARY KEY,
-    shipment_date TIMESTAMP NOT NULL,
-    address VARCHAR(100),
-    city VARCHAR(20),
-    state VARCHAR(100),
-    country VARCHAR(50),
-    zip_code VARCHAR(10),
-    customer_id INTEGER NOT NULL
-);
-
--- Cart table, managing customer carts with product quantities
-CREATE TABLE Cart (
-    cart_id SERIAL PRIMARY KEY,
-    customer_id INTEGER NOT NULL,
-    product_id INTEGER NOT NULL,
-    quantity INTEGER NOT NULL DEFAULT 1 CHECK (quantity > 0)
-);
-
--- Wishlist table, managing customer wishlists
-CREATE TABLE Wishlist (
-    wishlist_id SERIAL PRIMARY KEY,
-    customer_id INTEGER NOT NULL,
-    product_id INTEGER NOT NULL
-);
-
--- Payment table, storing payment details associated with orders
-CREATE TABLE Payment (
-    payment_id SERIAL PRIMARY KEY,
-    payment_date TIMESTAMP NOT NULL,
-    payment_method VARCHAR(100) NOT NULL,
-    amount DECIMAL(10, 2) NOT NULL CHECK (amount >= 0),
-    customer_id INTEGER NOT NULL
-);
-
--- Order table, managing customer orders
-CREATE TABLE "Order" (
-    order_id SERIAL PRIMARY KEY,
-    order_date TIMESTAMP NOT NULL,
-    total_price DECIMAL(10, 2) DEFAULT 0,
-    customer_id INTEGER NOT NULL
-);
-
--- Order_Item table, managing individual items within an order
-CREATE TABLE Order_Item (
-    order_item_id SERIAL PRIMARY KEY,
-    order_id INTEGER NOT NULL,
-    product_id INTEGER NOT NULL,
-    quantity INTEGER NOT NULL DEFAULT 1 CHECK (quantity > 0),
-    price DECIMAL(10, 2) NOT NULL,
-    product_snapshot JSONB
-);
-
--- Product table, managing product details
-CREATE TABLE Product (
-    product_id SERIAL PRIMARY KEY,
-    SKU VARCHAR(100) UNIQUE NOT NULL,
-    title VARCHAR(255) NOT NULL,
-    image VARCHAR(255),
-    images TEXT,
-    description TEXT,
-    price DECIMAL(10, 2) NOT NULL,
-    stock INTEGER NOT NULL CHECK (stock >= 0),
-    short_desc VARCHAR(255),
-    category_id INTEGER,
-    average_rating DECIMAL(3, 2) DEFAULT 0 -- Column to store average rating
-);
-
--- Category table, managing product categories
+-- Create Category table with hierarchical structure
 CREATE TABLE Category (
     category_id SERIAL PRIMARY KEY,
-    name VARCHAR(100) NOT NULL
+    parent_id INTEGER REFERENCES Category(category_id),
+    name VARCHAR(100) NOT NULL,
+    slug VARCHAR(100) NOT NULL UNIQUE,
+    description TEXT,
+    is_active BOOLEAN DEFAULT true,
+    display_order INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    metadata JSONB
 );
 
--- Review table, storing product reviews from customers
-CREATE TABLE Review (
-    review_id SERIAL PRIMARY KEY,
-    product_id INTEGER NOT NULL,
+-- Create Product table with enhanced features
+CREATE TABLE Product (
+    product_id SERIAL PRIMARY KEY,
+    category_id INTEGER NOT NULL,
+    SKU VARCHAR(100) UNIQUE NOT NULL,
+    title VARCHAR(255) NOT NULL,
+    slug VARCHAR(255) UNIQUE NOT NULL,
+    description TEXT,
+    short_desc VARCHAR(255),
+    price DECIMAL(10, 2) NOT NULL CHECK (price >= 0),
+    cost_price DECIMAL(10, 2) CHECK (cost_price >= 0),
+    discount_price DECIMAL(10, 2),
+    stock INTEGER NOT NULL DEFAULT 0 CHECK (stock >= 0),
+    low_stock_threshold INTEGER DEFAULT 10,
+    image VARCHAR(255),
+    images JSONB,
+    weight DECIMAL(8, 2),
+    dimensions JSONB,
+    is_active BOOLEAN DEFAULT true,
+    is_featured BOOLEAN DEFAULT false,
+    brand VARCHAR(100),
+    tags TEXT[],
+    attributes JSONB,
+    average_rating DECIMAL(3, 2) DEFAULT 0,
+    review_count INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    metadata JSONB,
+    CONSTRAINT valid_prices CHECK (
+        (discount_price IS NULL OR discount_price <= price) AND
+        (cost_price IS NULL OR cost_price <= price)
+    )
+);
+
+-- Create partitioned Order table
+CREATE TABLE "Order" (
+    order_id SERIAL PRIMARY KEY,
     customer_id INTEGER NOT NULL,
-    rating INT CHECK (rating >= 1 AND rating <= 5),
-    comment TEXT,
-    review_date TIMESTAMP DEFAULT NOW()
-);
-
--- Inventory_Log table, tracking inventory changes over time
-CREATE TABLE Inventory_Log (
-    log_id SERIAL PRIMARY KEY,
-    product_id INTEGER NOT NULL,
-    change INT NOT NULL,
-    change_date TIMESTAMP DEFAULT NOW()
-);
-
--- Alert_Log table, for low stock notifications
-CREATE TABLE Alert_Log (
-    alert_id SERIAL PRIMARY KEY,
-    product_id INTEGER NOT NULL,
-    alert_message TEXT,
-    alert_date TIMESTAMP DEFAULT NOW()
-);
-
--- Step 2: Add Foreign Key Constraints
-
--- Add foreign key constraints to Customer and Address tables
-ALTER TABLE Customer
-ADD FOREIGN KEY (default_address) REFERENCES Address(address_id) ON DELETE SET NULL;
-
-ALTER TABLE Address
-ADD FOREIGN KEY (customer_id) REFERENCES Customer(customer_id) ON DELETE CASCADE ON UPDATE CASCADE;
-
--- Add foreign key constraints to Shipment table
-ALTER TABLE Shipment
-ADD FOREIGN KEY (customer_id) REFERENCES Customer(customer_id) ON DELETE CASCADE ON UPDATE CASCADE;
-
--- Add foreign key constraints to Cart and Wishlist tables
-ALTER TABLE Cart
-ADD FOREIGN KEY (customer_id) REFERENCES Customer(customer_id) ON DELETE CASCADE,
-ADD FOREIGN KEY (product_id) REFERENCES Product(product_id) ON DELETE CASCADE;
-
-ALTER TABLE Wishlist
-ADD FOREIGN KEY (customer_id) REFERENCES Customer(customer_id) ON DELETE CASCADE,
-ADD FOREIGN KEY (product_id) REFERENCES Product(product_id) ON DELETE CASCADE;
-
--- Add foreign key constraints to Payment table
-ALTER TABLE Payment
-ADD FOREIGN KEY (customer_id) REFERENCES Customer(customer_id) ON DELETE CASCADE;
-
--- Add foreign key constraints to Order and Order_Item tables
-ALTER TABLE "Order"
-ADD FOREIGN KEY (customer_id) REFERENCES Customer(customer_id) ON DELETE CASCADE;
-
-ALTER TABLE Order_Item
-ADD FOREIGN KEY (order_id) REFERENCES "Order"(order_id) ON DELETE CASCADE,
-ADD FOREIGN KEY (product_id) REFERENCES Product(product_id) ON DELETE CASCADE;
-
--- Add foreign key constraint to Product table
-ALTER TABLE Product
-ADD FOREIGN KEY (category_id) REFERENCES Category(category_id) ON DELETE SET NULL;
-
--- Add foreign key constraints to Review table
-ALTER TABLE Review
-ADD FOREIGN KEY (product_id) REFERENCES Product(product_id) ON DELETE CASCADE,
-ADD FOREIGN KEY (customer_id) REFERENCES Customer(customer_id) ON DELETE CASCADE;
-
--- Add foreign key constraint to Inventory_Log table
-ALTER TABLE Inventory_Log
-ADD FOREIGN KEY (product_id) REFERENCES Product(product_id) ON DELETE CASCADE;
-
--- Add foreign key constraint to Alert_Log table
-ALTER TABLE Alert_Log
-ADD FOREIGN KEY (product_id) REFERENCES Product(product_id) ON DELETE CASCADE;
-
-
--- Enable pgcrypto extension to allow encryption functions
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
-
--- Modify Customer table to store hashed passwords in BYTEA format
--- Add encrypted payment method column in Payment table
-ALTER TABLE Payment
-ADD COLUMN encrypted_payment_method VARCHAR(255);
-
--- Example usage: Insert an encrypted payment method (replace 'encryption_key' with an actual secure key)
--- INSERT INTO Payment (encrypted_payment_method) VALUES (pgp_sym_encrypt('credit_card', 'encryption_key'));
-
--- Modify the Customer table to add a CHECK constraint for email format
-ALTER TABLE Customer
-ADD CONSTRAINT email_format_check 
-CHECK (email ~* '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$');
-
--- Modify the Address table to add a CHECK constraint for phone number format
-ALTER TABLE Address
-ADD CONSTRAINT phone_format_check 
-CHECK (phone ~ '^[0-9]{10}$');
-
+    order_date TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    total_price DECIMAL(10, 2) DEFAULT 0,
+    status order_status DEFAULT 'pending',
